@@ -126,7 +126,7 @@ BUFFER_MAX_LINES = int(os.environ.get("ODIN_BUFFER_MAX_LINES", "0"))
 PAYLOAD_HEADER = os.environ.get("ODIN_PAYLOAD_HEADER", "")
 PAYLOAD_FOOTER = os.environ.get(
     "ODIN_PAYLOAD_FOOTER",
-    "for more context view this screenshot: {url}",
+    "(screenshot for more context: {url})",
 )
 
 
