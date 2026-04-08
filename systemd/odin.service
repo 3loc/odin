@@ -1,0 +1,37 @@
+[Unit]
+Description=odin orchestrator daemon
+Documentation=https://github.com/3loc/odin
+After=network-online.target mimir.service heimdall@meeting.service
+Wants=network-online.target
+
+# When mimir or heimdall restarts, odin restarts too — reader threads
+# will reconnect to the freshly-started services with their backoff
+# loops, but a restart guarantees a clean state.
+PartOf=mimir.service
+
+[Service]
+Type=simple
+User=ted
+Group=ted
+
+# ted is in the input group already (via heimdall's playbook), which
+# is what gives odin permission to read /dev/input/event* for the
+# foot pedal.
+SupplementaryGroups=input
+
+EnvironmentFile=/etc/odin/odin.env
+ExecStart=/usr/local/bin/odin
+
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+# Mild sandboxing — odin reads /dev/input and talks TCP to mimir,
+# zerokb, and heimdall. Nothing else.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

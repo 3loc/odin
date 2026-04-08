@@ -1,0 +1,97 @@
+---
+# Deploys odin (orchestrator daemon) to the local Minisforum (agneta).
+#
+# Idempotent. odin is pure stdlib Python so the install is just:
+#   - install evtest (for ad-hoc pedal debugging)
+#   - copy odin.py to /usr/local/bin/odin
+#   - install systemd unit and env file
+#   - enable + start odin.service
+- name: Deploy odin (orchestrator daemon)
+  hosts: agneta
+  become: true
+
+  vars:
+    odin_user: ted
+
+  tasks:
+    # --- System packages ---
+    - name: Install system packages required by odin
+      pacman:
+        name:
+          - ansible        # self-managed
+          - evtest         # for ad-hoc debugging the foot pedal evdev events
+          - python         # odin is pure stdlib
+        state: present
+        update_cache: true
+
+    # --- Verify the foot pedal is present ---
+    - name: Probe for PCsensor FootSwitch on USB
+      command: lsusb -d 3553:b001
+      register: pedal_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if foot pedal is not currently plugged in
+      debug:
+        msg: "WARNING: PCsensor FootSwitch (3553:b001) not found on USB. odin will retry but won't fire until you plug it in."
+      when: pedal_probe.rc != 0
+
+    # --- Install odin daemon ---
+    - name: Install odin.py to /usr/local/bin/odin
+      copy:
+        src: ../src/odin.py
+        dest: /usr/local/bin/odin
+        owner: root
+        group: root
+        mode: '0755'
+      notify: restart odin
+
+    - name: Ensure /etc/odin config directory exists
+      file:
+        path: /etc/odin
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install odin.env
+      copy:
+        src: ../systemd/odin.env
+        dest: /etc/odin/odin.env
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart odin
+
+    - name: Install odin.service
+      copy:
+        src: ../systemd/odin.service
+        dest: /etc/systemd/system/odin.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart odin
+
+    - name: Force any pending reloads / restarts before enabling
+      meta: flush_handlers
+
+    - name: Enable and start odin.service
+      systemd:
+        name: odin.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: restart odin
+      systemd:
+        name: odin.service
+        state: restarted
+        daemon_reload: true
+      failed_when: false
