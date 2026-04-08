@@ -52,6 +52,11 @@ PEDAL_KEYCODE = int(os.environ.get("ODIN_PEDAL_KEYCODE", "48"))  # KEY_B by defa
 MIMIR_HOST = os.environ.get("ODIN_MIMIR_HOST", "127.0.0.1")
 MIMIR_PORT = int(os.environ.get("ODIN_MIMIR_PORT", "7200"))
 
+# Pi Zero (zerokb) is reached as a literal IP because zerokb's own
+# ansible playbook deliberately disables avahi-daemon as part of the
+# read-only-root minimization. We can't use zero.local. The Pi's IP
+# is the only literal LAN address still in odin's defaults — set
+# ODIN_ZEROKB_HOST in odin.env if your Pi lives somewhere else.
 ZEROKB_HOST = os.environ.get("ODIN_ZEROKB_HOST", "192.168.10.8")
 ZEROKB_PORT = int(os.environ.get("ODIN_ZEROKB_PORT", "7070"))
 
@@ -59,13 +64,20 @@ ZEROKB_PORT = int(os.environ.get("ODIN_ZEROKB_PORT", "7070"))
 # heimdall to capture+save the current frame. Press 2: drain the
 # transcript buffer and type it via zerokb together with the
 # SNAPSHOT_VIEW_URL footer pointing at the saved snapshot.
+#
+# CAPTURE_URL points at heimdall on localhost (we're on the same
+# box). VIEW_URL is what gets typed into the host's Claude Code,
+# so it has to be reachable from the host machine — `agneta.local`
+# is the mDNS name agneta announces via avahi-daemon (installed by
+# heimdall's playbook). This is portable across LAN moves and DHCP
+# renewals.
 SNAPSHOT_CAPTURE_URL = os.environ.get(
     "ODIN_SNAPSHOT_CAPTURE_URL",
     "http://127.0.0.1:7100/snapshot.png",
 )
 SNAPSHOT_VIEW_URL = os.environ.get(
     "ODIN_SNAPSHOT_VIEW_URL",
-    "http://192.168.10.13:7100/snapshot.png",
+    "http://agneta.local:7100/snapshot.png",
 )
 
 # Debounce: ignore pedal presses that arrive within this many ms of
