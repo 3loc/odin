@@ -74,15 +74,22 @@ SNAPSHOT_VIEW_URL = os.environ.get(
 # before the user has had a chance to switch tabs.
 PRESS_DEBOUNCE_MS = int(os.environ.get("ODIN_PRESS_DEBOUNCE_MS", "300"))
 
-# Cap the transcript buffer to the last N lines. mimir produces ~5s
-# WhisperX windows so 24 lines is roughly the last 2 minutes of audio.
-# This used to be 12 (1 minute) when we thought zerokb typing was the
-# bottleneck — turns out the Pi types fast enough to handle 2 minutes
-# of context per press cycle without an annoying delay.
-# Long-term meeting context still accumulates in Claude Code's session
-# history across multiple pedal cycles, so per-press payloads don't
-# need to carry the whole conversation.
-BUFFER_MAX_LINES = int(os.environ.get("ODIN_BUFFER_MAX_LINES", "24"))
+# Cap the transcript buffer to the last N lines, or 0 to disable
+# the cap entirely. Default is 0 = unbounded — the buffer runs
+# freely from the last successful press 2 (the dump) until the next
+# press 2, no matter how long that is.
+#
+# Why this is safe: mimir's WhisperX VAD already filters out silence
+# — windows with no speech generate zero segments and are never
+# broadcast. So the buffer only accumulates lines for moments of
+# actual speech, not for the wall-clock duration since the last
+# press. A typical 30-minute meeting where people speak roughly half
+# the time produces ~180 transcript lines, ~14 KB of payload, which
+# zerokb types in about a minute.
+#
+# Set this to a positive integer if you want a hard cap as a safety
+# net (e.g. 60 = roughly the last 5 minutes of speech).
+BUFFER_MAX_LINES = int(os.environ.get("ODIN_BUFFER_MAX_LINES", "0"))
 
 # Why no bracketed paste mode here:
 #
@@ -204,11 +211,13 @@ def mimir_reader_thread() -> None:
                         continue
                     with buffer_lock:
                         buffer.append(line)
-                        # Cap to the last BUFFER_MAX_LINES. The buffer is
-                        # always "the last N lines" regardless of how
-                        # long it's been since the last press 2 — we
-                        # never carry stale audio context forward.
-                        if len(buffer) > BUFFER_MAX_LINES:
+                        # Optional safety cap. When BUFFER_MAX_LINES > 0,
+                        # trim oldest lines so the buffer never exceeds
+                        # the cap. When 0 (default), the buffer grows
+                        # unbounded between press 2's — relying on
+                        # WhisperX's VAD to keep silence from inflating
+                        # it.
+                        if BUFFER_MAX_LINES > 0 and len(buffer) > BUFFER_MAX_LINES:
                             del buffer[0 : len(buffer) - BUFFER_MAX_LINES]
         except OSError as e:
             log.error("mimir: read error: %s", e)
