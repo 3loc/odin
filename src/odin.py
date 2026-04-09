@@ -346,9 +346,14 @@ def build_payload(lines: list[str]) -> bytes:
     # Defensive: replace any stray newlines or carriage returns inside
     # the joined body with spaces. Mimir shouldn't emit newlines mid-
     # segment, but if a future model variant ever did, we'd silently
-    # spam Claude Code again. Cheap belt-and-suspenders.
+    # submit the typed text in pieces. Cheap belt-and-suspenders.
     body = body.replace("\r", " ").replace("\n", " ")
-    return body.encode("utf-8") + b"\n"
+    # Note: NO trailing newline. The user explicitly does not want
+    # zerokb to press Enter for them at the end of the dump — they
+    # want a chance to read what was typed in Claude Code's input
+    # field, edit if needed, and submit manually. Earlier versions
+    # appended b"\n" here to auto-submit; that was the wrong default.
+    return body.encode("utf-8")
 
 
 def send_to_zerokb(payload_bytes: bytes) -> bool:
