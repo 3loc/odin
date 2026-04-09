@@ -13,10 +13,26 @@ Two threads:
                         under a lock.
 
   pedal_listener_thread blocking read() on the foot pedal evdev
-                        device. On every "key press" event (KEY value
-                        == 1, autorepeat and release ignored), drains
-                        the buffer, formats the payload, sends it to
-                        zerokb in a single TCP write.
+                        device. Tracks press-down (value=1) and
+                        release (value=0) events separately:
+
+                          * short press (release < LONG_PRESS_SEC
+                            after press-down): fires the two-press
+                            cycle on release — press 1 captures the
+                            snapshot, press 2 drains the buffer and
+                            sends the payload to zerokb.
+
+                          * long press (>= LONG_PRESS_SEC held): fires
+                            the cancel gesture — clears odin's
+                            transcript buffer, disarms any in-progress
+                            two-press cycle, and sends an ABORT
+                            command to zerokb's control port so the
+                            Pi Zero drops whatever it was still
+                            typing. Useful when you accidentally drain
+                            an hour of meeting and the laptop is now
+                            flooding with keystrokes.
+
+                        Autorepeat events (value=2) are ignored.
 
 Configured by environment variables, normally via the systemd unit's
 EnvironmentFile. See odin.env for the full list.
@@ -59,6 +75,21 @@ MIMIR_PORT = int(os.environ.get("ODIN_MIMIR_PORT", "7200"))
 # ODIN_ZEROKB_HOST in odin.env if your Pi lives somewhere else.
 ZEROKB_HOST = os.environ.get("ODIN_ZEROKB_HOST", "192.168.10.8")
 ZEROKB_PORT = int(os.environ.get("ODIN_ZEROKB_PORT", "7070"))
+
+# zerokb's out-of-band control port. A separate TCP port on the Pi
+# Zero that accepts text commands (currently just "ABORT"). Used by
+# the long-press handler to interrupt zerokb's in-flight typing when
+# the user wants to cancel a monster transcript dump. Kept on the
+# same host as ZEROKB_HOST by convention.
+ZEROKB_CONTROL_PORT = int(os.environ.get("ODIN_ZEROKB_CONTROL_PORT", "7071"))
+
+# Long-press threshold for the "cancel everything" gesture: hold
+# the pedal down for at least this many seconds and odin will clear
+# its own transcript buffer AND tell zerokb to abort whatever it's
+# currently typing. Defaults to 3 s, which is comfortably longer
+# than any accidental hold and much shorter than the typical
+# multi-minute typing marathon we're trying to cancel.
+LONG_PRESS_SEC = float(os.environ.get("ODIN_LONG_PRESS_SEC", "3.0"))
 
 # Two-press cycle. Press 1: POST to SNAPSHOT_CAPTURE_URL, telling
 # heimdall to capture+save the current frame. Press 2: drain the
@@ -164,10 +195,29 @@ buffer: list[str] = []
 buffer_lock = threading.Lock()
 
 # Two-press state. False = waiting for press 1 (capture). True = capture
-# done, waiting for press 2 (dump). Owned by the pedal-listener thread,
-# which is the only thread that mutates it — no lock needed.
+# done, waiting for press 2 (dump). Mutated by the pedal-listener
+# thread (short-press path) AND by the long-press timer callback
+# (cancel path), so it's now protected by press_state_lock below.
 snapshot_armed = False
-last_press_at = 0.0  # time.monotonic() of the most recent press, for debounce
+last_press_at = 0.0  # time.monotonic() of the most recent short press, for debounce
+
+# Press state for the long-press detector. The pedal-listener thread
+# owns the transitions; the long-press timer callback runs on its
+# own thread (threading.Timer) and reads/writes the same fields, so
+# both sides hold press_state_lock.
+press_state_lock = threading.Lock()
+press_state = {
+    # time.monotonic() at press-down, or None when not currently pressed
+    "down_at": None,  # type: float | None
+    # threading.Timer scheduled to fire the long-press callback
+    # LONG_PRESS_SEC after press-down. Cancelled on release; also
+    # cleared after it fires.
+    "long_press_timer": None,  # type: threading.Timer | None
+    # True after the long-press callback has fired, so the matching
+    # release event knows NOT to also fire a short press. Reset on
+    # the next press-down.
+    "long_press_fired": False,
+}
 
 
 # ─── mimir reader ────────────────────────────────────────────────────────────
@@ -262,7 +312,10 @@ def pedal_listener_thread() -> None:
             backoff = min(backoff * 2, 5.0)
             continue
 
-        log.info("pedal: listening for keycode=%d (value=1) presses", PEDAL_KEYCODE)
+        log.info(
+            "pedal: listening for keycode=%d (press + release, long-press=%.1fs)",
+            PEDAL_KEYCODE, LONG_PRESS_SEC,
+        )
         backoff = 0.5
         try:
             while not shutdown_event.is_set():
@@ -275,9 +328,17 @@ def pedal_listener_thread() -> None:
                 _sec, _usec, ev_type, code, value = struct.unpack(
                     INPUT_EVENT_FORMAT, data
                 )
-                if ev_type == EV_KEY and code == PEDAL_KEYCODE and value == 1:
-                    log.info("pedal: PRESS detected")
-                    on_pedal_press()
+                if ev_type != EV_KEY or code != PEDAL_KEYCODE:
+                    continue
+                # value == 1 → press-down (start long-press timer)
+                # value == 0 → release  (fire short press or cleanup after long-press)
+                # value == 2 → autorepeat (ignore — we care about the edges only)
+                if value == 1:
+                    log.info("pedal: PRESS-DOWN")
+                    _handle_press_down()
+                elif value == 0:
+                    log.info("pedal: RELEASE")
+                    _handle_press_up()
         except OSError as e:
             log.error("pedal: read error: %s", e)
         finally:
@@ -292,6 +353,82 @@ def pedal_listener_thread() -> None:
             backoff = min(backoff * 2, 5.0)
 
     log.info("pedal: listener exiting")
+
+
+# ─── press gesture state machine ─────────────────────────────────────────────
+
+def _handle_press_down() -> None:
+    """Record a press-down event and schedule the long-press timer.
+
+    Called from the pedal-listener thread on value=1. Starts a
+    threading.Timer that fires after LONG_PRESS_SEC unless cancelled
+    by a release event before it fires. The timer runs on its own
+    thread; both it and this function touch press_state under
+    press_state_lock.
+    """
+    with press_state_lock:
+        if press_state["down_at"] is not None:
+            # Already pressed (spurious duplicate press-down, e.g.
+            # missed release event). Treat as a no-op rather than
+            # stacking timers.
+            log.warning("pedal: press-down while already down, ignoring")
+            return
+        press_state["down_at"] = time.monotonic()
+        press_state["long_press_fired"] = False
+        timer = threading.Timer(LONG_PRESS_SEC, _long_press_callback)
+        timer.daemon = True
+        press_state["long_press_timer"] = timer
+        timer.start()
+
+
+def _handle_press_up() -> None:
+    """Handle a release event — fire short press unless long-press already fired.
+
+    Called from the pedal-listener thread on value=0. Cancels the
+    long-press timer and, if the long-press hasn't already fired,
+    fires the short-press action (the existing two-press cycle —
+    snapshot on press 1, drain-and-dump on press 2).
+    """
+    fire_short = False
+    with press_state_lock:
+        if press_state["down_at"] is None:
+            # Stray release with no matching press-down. Likely a
+            # state-recovery situation after a missed event. Ignore.
+            return
+        if press_state["long_press_timer"] is not None:
+            press_state["long_press_timer"].cancel()
+            press_state["long_press_timer"] = None
+        if not press_state["long_press_fired"]:
+            fire_short = True
+        press_state["down_at"] = None
+        # long_press_fired stays True until the next press-down so
+        # nothing else can sneak a short press in; _handle_press_down
+        # resets it.
+
+    if fire_short:
+        on_pedal_press()
+
+
+def _long_press_callback() -> None:
+    """Fired by threading.Timer after LONG_PRESS_SEC of continuous hold.
+
+    Runs on the timer thread, not the pedal-listener thread. Checks
+    that the press is still active (race with the cancel path in
+    _handle_press_up) and, if so, fires the cancel gesture.
+    """
+    with press_state_lock:
+        if press_state["down_at"] is None:
+            # User released between timer fire and lock acquisition —
+            # the short-press path already ran. Nothing to do.
+            return
+        if press_state["long_press_fired"]:
+            return  # defensive; shouldn't happen
+        press_state["long_press_fired"] = True
+        press_state["long_press_timer"] = None
+
+    # Fire the long-press action outside the lock so it can't deadlock
+    # on anything held by the short-press path.
+    on_pedal_long_press()
 
 
 # ─── pedal-press handler ─────────────────────────────────────────────────────
@@ -369,6 +506,46 @@ def send_to_zerokb(payload_bytes: bytes) -> bool:
         return False
 
 
+def abort_zerokb() -> bool:
+    """Tell zerokb to drop whatever it's currently typing.
+
+    Connects to zerokb's separate control port (ZEROKB_CONTROL_PORT,
+    default 7071) and sends a single "ABORT\\n" line. zerokb's
+    control listener runs on its own thread so this works even when
+    the data port (7070) is blocked writing a huge payload to HID.
+    The control handler sets a shared atomic flag that the data-side
+    typing loop checks between every byte; once set, the remaining
+    bytes from the in-flight connection are drained silently rather
+    than typed.
+
+    Returns True on successful send, False on any IO error. Failure
+    is logged but not raised — the long-press cancel path is a
+    best-effort thing; if the Pi is unreachable, the user can still
+    fall back to unplugging the USB cable.
+    """
+    try:
+        log.info("zerokb: sending ABORT to %s:%d",
+                 ZEROKB_HOST, ZEROKB_CONTROL_PORT)
+        with socket.create_connection(
+            (ZEROKB_HOST, ZEROKB_CONTROL_PORT), timeout=2
+        ) as zk:
+            zk.sendall(b"ABORT\n")
+            # Read the response (zerokb writes "OK\n" or "ERR ..."),
+            # best effort. Not worth failing the abort if the
+            # response is malformed — the flag has been set either
+            # way on the server side.
+            try:
+                zk.settimeout(1.0)
+                resp = zk.recv(64)
+                log.info("zerokb: ABORT response: %r", resp.strip())
+            except OSError:
+                pass
+        return True
+    except OSError as e:
+        log.error("zerokb: ABORT send failed (%s)", e)
+        return False
+
+
 def on_pedal_press() -> None:
     """Two-press cycle: press 1 captures snapshot, press 2 drains + dumps.
 
@@ -421,6 +598,50 @@ def on_pedal_press() -> None:
     log.info("press 2: complete, ready for next cycle")
 
 
+def on_pedal_long_press() -> None:
+    """Cancel gesture — drop everything and tell zerokb to stop typing.
+
+    Called from the long-press timer callback after LONG_PRESS_SEC
+    of continuous hold. Does three things, in order:
+
+      1. Clear odin's own transcript buffer so the next short press
+         doesn't re-send anything we're trying to cancel.
+      2. Disarm any in-progress two-press cycle (if the user long-
+         presses after press 1 but before press 2, they probably
+         want the armed snapshot forgotten too).
+      3. Send ABORT to zerokb's control port so the Pi Zero drops
+         whatever it's currently typing into the host.
+
+    The long-press gesture is best-effort: if zerokb is unreachable
+    (e.g. Pi Zero powered off) the odin-side cleanup still happens
+    and the error is logged. The user's fallback is to unplug the
+    Pi Zero's USB cable.
+    """
+    global snapshot_armed
+
+    log.warning("pedal: LONG PRESS — canceling everything")
+
+    # 1. Clear the local transcript buffer.
+    with buffer_lock:
+        dropped = len(buffer)
+        buffer.clear()
+    log.info("long-press: dropped %d buffered transcript lines", dropped)
+
+    # 2. Disarm any armed two-press cycle.
+    if snapshot_armed:
+        snapshot_armed = False
+        log.info("long-press: disarmed in-progress two-press cycle")
+
+    # 3. Tell zerokb to abort.
+    if abort_zerokb():
+        log.info("long-press: zerokb abort sent successfully")
+    else:
+        log.error(
+            "long-press: zerokb abort failed — the Pi Zero may still be "
+            "typing; unplug the USB cable as a fallback"
+        )
+
+
 # ─── main ────────────────────────────────────────────────────────────────────
 
 def shutdown(signum, frame) -> None:
@@ -433,11 +654,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
 
     log.info(
-        "odin starting: pedal=%s keycode=%d mimir=%s:%d zerokb=%s:%d "
-        "snapshot_capture=%s snapshot_view=%s debounce=%dms",
+        "odin starting: pedal=%s keycode=%d mimir=%s:%d "
+        "zerokb=%s:%d (control=%d) "
+        "snapshot_capture=%s snapshot_view=%s "
+        "debounce=%dms long_press=%.1fs",
         PEDAL_DEVICE, PEDAL_KEYCODE, MIMIR_HOST, MIMIR_PORT,
-        ZEROKB_HOST, ZEROKB_PORT,
-        SNAPSHOT_CAPTURE_URL, SNAPSHOT_VIEW_URL, PRESS_DEBOUNCE_MS,
+        ZEROKB_HOST, ZEROKB_PORT, ZEROKB_CONTROL_PORT,
+        SNAPSHOT_CAPTURE_URL, SNAPSHOT_VIEW_URL,
+        PRESS_DEBOUNCE_MS, LONG_PRESS_SEC,
     )
 
     threads = [
